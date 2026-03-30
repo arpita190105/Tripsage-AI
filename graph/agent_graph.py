@@ -46,66 +46,101 @@ def create_agent():
     if SCORING_AVAILABLE:
         tools.append(score_destination)
 
-    agent = create_react_agent(
+    return create_react_agent(
         model=llm,
         tools=tools,
         prompt=SYSTEM_PROMPT
     )
 
-    return agent
 
-
-def build_messages_with_history(chat_history: list, current_prompt: str) -> list:
+def build_context_prefix(trip_memory: dict) -> str:
     """
-    Converts Streamlit session messages into LangGraph message format
-    and appends the current user message.
-    Keeps last 10 exchanges max to avoid token overflow.
+    Build a clean context prefix from explicitly stored trip memory.
+    This replaces the unreliable regex extraction approach.
+    trip_memory is a dict stored in st.session_state.trip_memory
     """
-    messages = []
+    if not trip_memory:
+        return ""
 
-    # Take last 10 messages (5 exchanges) for context window safety
-    recent_history = chat_history[-10:] if len(chat_history) > 10 else chat_history
-
-    for msg in recent_history:
-        role = msg["role"]
-        content = msg["content"]
-        if role == "user":
-            messages.append(("user", content))
-        elif role == "assistant":
-            messages.append(("assistant", content))
-
-    # Add current message
-    messages.append(("user", current_prompt))
-    return messages
+    lines = ["[CURRENT TRIP CONTEXT — always use this for follow-up questions]"]
+    if trip_memory.get("destination"):
+        lines.append(f"Destination: {trip_memory['destination']}")
+    if trip_memory.get("days"):
+        lines.append(f"Duration: {trip_memory['days']} days")
+    if trip_memory.get("style"):
+        lines.append(f"Travel style: {trip_memory['style']}")
+    if trip_memory.get("interests"):
+        lines.append(f"Interests: {trip_memory['interests']}")
+    lines.append("[END CONTEXT]")
+    return "\n".join(lines) + "\n\n"
 
 
-def run_agent(agent, user_message: str, chat_history: list = None) -> str:
+def extract_trip_memory(user_message: str) -> dict:
     """
-    Run the agent with full conversation history for context awareness.
-    Falls back gracefully on any error.
+    Extract trip entities from a message and return as a clean dict.
+    Only runs when a new trip plan is explicitly requested.
+    Called from main.py when sidebar Plan button is used.
+    """
+    import re
+    memory = {}
+
+    msg = user_message.lower()
+
+    # Destination — look for "trip to X" or "visit X"
+    patterns = [
+        r"trip to ([a-zA-Z][a-zA-Z\s,]{2,40}?)[\.\,\?]",
+        r"visit(?:ing)? ([a-zA-Z][a-zA-Z\s,]{2,40}?)[\.\,\?]",
+        r"itinerary.*?for ([a-zA-Z][a-zA-Z\s,]{2,40}?)[\.\,\?]",
+        r"plan.*?to ([a-zA-Z][a-zA-Z\s,]{2,40}?)[\.\,\?]",
+    ]
+    for p in patterns:
+        m = re.search(p, msg)
+        if m:
+            memory["destination"] = m.group(1).strip().title()
+            break
+
+    # Days
+    m = re.search(r"(\d+)[- ]day", msg)
+    if m:
+        memory["days"] = m.group(1)
+
+    # Style
+    for s in ["budget", "mid-range", "midrange", "luxury"]:
+        if s in msg:
+            memory["style"] = s
+            break
+
+    # Interests
+    known = ["food", "history", "culture", "nature", "beach",
+             "adventure", "shopping", "photography", "wellness", "nightlife"]
+    found = [i for i in known if i in msg]
+    if found:
+        memory["interests"] = ", ".join(found)
+
+    return memory
+
+
+def run_agent(agent, user_message: str, trip_memory: dict = None) -> str:
+    """
+    Run agent with explicit trip memory context.
+    Fast — sends only ~100 tokens of context instead of full history.
     """
     try:
-        if chat_history is None:
-            chat_history = []
+        context_prefix = build_context_prefix(trip_memory or {})
+        full_message = context_prefix + user_message
 
-        messages = build_messages_with_history(chat_history, user_message)
-        result = agent.invoke({"messages": messages})
+        result = agent.invoke({
+            "messages": [("user", full_message)]
+        })
         return result["messages"][-1].content
 
     except Exception as e:
-        error_msg = str(e).lower()
-        if "rate limit" in error_msg:
-            return "I'm getting too many requests right now. Please wait a moment and try again."
-        elif "api key" in error_msg or "authentication" in error_msg:
-            return "There's a connection issue. Please check the API key setup."
-        elif "timeout" in error_msg:
-            return "The request timed out. Please try a shorter question."
-        elif "context" in error_msg or "token" in error_msg:
-            # History too long — retry with just current message
-            try:
-                result = agent.invoke({"messages": [("user", user_message)]})
-                return result["messages"][-1].content
-            except Exception:
-                return "Something went wrong. Please try again."
+        err = str(e).lower()
+        if "rate limit" in err:
+            return "Rate limit hit — please wait 10 seconds and try again."
+        elif "api key" in err or "auth" in err:
+            return "API key error — check your GROQ_API_KEY in .env."
+        elif "timeout" in err:
+            return "Request timed out — try a simpler question."
         else:
-            return f"Something went wrong: Please try rephrasing your question."
+            return "Something went wrong. Please try again or clear the chat."
